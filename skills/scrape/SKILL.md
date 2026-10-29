@@ -80,7 +80,7 @@ description: 스크래핑을 모르는 사람이 웹사이트에서 데이터를
 
 1. `references/recipe.md`를 따라 `~/.scrape/recipes/<name>.json`에 레시피를 씁니다(처음엔 그 문서를 읽으세요. `examples/`에 전략별로 동작하는 레시피가 있습니다). 전략을 고른 이유를 `notes`에 적습니다. 쓰기 전에 `~/.scrape/recipes/`에 같은 `source`의 레시피가 있는지 보세요. 있으면: 사용자가 '다시 돌려줘'라고 한 게 아니면 새 요청으로 보고 분석은 그대로 하되, 기존 파일을 `<name>.bak.json`으로 옮긴 뒤 씁니다. 같은 이름을 다시 쓸 때는 `--resume`을 쓰지 말고 `~/.scrape/state/<name>.json`을 지우고 시작합니다. 최종 보고에 '기존 레시피를 갱신했다(이전본 `<name>.bak.json`)'를 적습니다.
 2. 사이트가 브라우저 세션(로그인, 통과한 챌린지)을 필요로 했다면 쿠키를 먼저 내보내고(recipe.md의 `session` 참고) 그 파일을 참조합니다.
-3. `node collect.mjs <name> --dry-run` → 채움률 확인. 80% 미만인 필드는 보통 셀렉터가 틀렸거나 지연 로딩입니다. 전체 실행 전에 고치세요. 예외 둘: (a) `detail` 필드는 dry-run이 상세 페이지를 최대 3개만 방문하므로 낮게 나오는 게 정상입니다. 방문한 건수 대비로만 보세요(3건 방문에 3건 채움이면 정상). (b) 모든 필드가 0%면 셀렉터보다 차단·헤드리스를 먼저 의심하고 `--dry-run --headful`로 다시 돌리세요. 그때 채워지면 헤드리스 차단입니다. 행 수도 보세요: 브라우저에서 본 페이지당 항목 수보다 적으면(50개인데 30행) 스크롤 지연 로딩이니 `wait.scroll: {"count": 50}`을 넣습니다.
+3. `node collect.mjs <name> --dry-run` → 채움률 확인. 80% 미만인 필드는 보통 셀렉터가 틀렸거나 지연 로딩입니다. 전체 실행 전에 고치세요. 예외 둘: (a) `detail` 필드는 dry-run이 상세 페이지를 최대 3개만 방문하므로 낮게 나오는 게 정상입니다. 방문한 건수 대비로만 보세요(3건 방문에 3건 채움이면 정상). (b) 모든 필드가 0%면 셀렉터보다 차단·헤드리스를 먼저 의심합니다. 수집기는 숨은(headless) 브라우저가 첫 페이지에서 막히면 스스로 한 번 창을 띄워 다시 해 보고 요약에 `retried_visible`을 남깁니다(레딧, GeekNews). 이때는 사용자에게 "이 사이트는 수집할 때 창이 잠깐 뜹니다"라고 미리 말하세요. `--headless`를 직접 주면 재시도하지 않습니다. 행 수도 보세요: 브라우저에서 본 페이지당 항목 수보다 적으면(50개인데 30행) 스크롤 지연 로딩이니 `wait.scroll: {"count": 50}`을 넣습니다.
 4. `node collect.mjs <name> --max-pages N`. 기본 출력 `~/Downloads/<name>-<date>.csv`. stdout 마지막 줄이 JSON 요약입니다. `stopped_reason`, `fill_rate`, `sample`을 읽으세요.
 5. 평이한 말로 보고: 파일 위치, 행·페이지 수, 빈 칸이 있는 필드와 그 개수, 샘플 3행. 그리고: "다음에 '<name> 레시피 다시 돌려줘'라고 하시면 새로 받아옵니다."
 6. 보고를 마쳤으면 분석·확인에 썼던 Playwright MCP 브라우저를 `browser_close`로 닫습니다. 이 창은 작업이 끝나도 저절로 닫히지 않으므로, 열었으면 마지막에 반드시 닫으세요. 예외: 사용자가 `--cdp`로 자기 Chrome을 연결했거나 직접 로그인·챌린지를 통과한 창이면 닫지 않습니다(그 창은 사용자의 것입니다). 수집기(`collect.mjs`)가 띄우는 자체 Chrome은 스스로 닫으므로 대상이 아닙니다.
@@ -123,7 +123,7 @@ description: 스크래핑을 모르는 사람이 웹사이트에서 데이터를
 2. **사람이 확인을 통과하게.** Playwright MCP 창은 사용자가 클릭할 수 있는 실제 Chrome입니다. 챌린지를 완료해 달라고 하고, 기다리고, `overview()` 재실행. 수집기가 통과한 세션을 물려받도록 쿠키를 내보냅니다.
 3. **사람처럼 행동.** `rate.delay_ms`를 올리고(3000+), `concurrency` 1 유지, 수집기를 `--headful --wait-for-human`으로 돌려 재확인 때 실패 대신 멈추게. `--wait-for-human`은 `js_challenge`·`turnstile`·`captcha`·`login_required`에만 유효하고, `access_denied`·`rate_limited`는 사람이 클릭으로 통과할 수 없어 즉시 종료합니다(`collect.mjs`의 `SOLVABLE_BY_HUMAN`). **`diagnosis.kind`가 `access_denied`인데 MCP 창에서는 다음 페이지가 열리면 이 단계를 건너뛰고 바로 4단계로 갑니다.** 수집기 자체 브라우저의 속도를 늦춰도 Akamai가 그 브라우저에 대해 이미 내린 판정은 바뀌지 않습니다.
 4. **사용자의 실제 브라우저로 수집** (수집기 자체 브라우저에는 하드 차단 — 예: Akamai가 1페이지 이후 403 — 을 주지만 사람에게는 잘 열리는 사이트). 두 가지 방법:
-   - **세션 안의 실제 브라우저**(가장 확실): 사용자가 실제로 보고 있는 브라우저를 모세요 — Claude in Chrome(`mcp__claude-in-chrome__*`, 로그인된 진짜 Chrome) 또는 Playwright MCP 창. 먼저 차단되던 페이지(예: 2페이지)가 거기서 실제로 열리는지 확인합니다. 그다음, 네비게이션마다 `window`가 날아가므로 페이지 안에 누적합니다: 이동 → `scripts/page/helpers.js` 주입 → `window.__scrape.collectInto(fields, container, { dedupe_key, reset: <첫 페이지만 true> })`, 사람 속도로 페이지별 반복. 마지막에 `window.__scrape.drain()`이 전체 행을 돌려줍니다. JSON 파일로 저장한 뒤 `node scripts/write-csv.mjs <그.json> --name <name> --dedupe-key <key>`를 돌리면 수집기와 같은 UTF-8 BOM CSV가 됩니다. 레시피의 `fields`/`container`를 그대로 써서 매핑은 변하지 않습니다.
+   - **세션 안의 실제 브라우저**(가장 확실): 사용자가 실제로 보고 있는 브라우저를 모세요 — Claude in Chrome(`mcp__claude-in-chrome__*`, 로그인된 진짜 Chrome) 또는 Playwright MCP 창. 먼저 차단되던 페이지(예: 2페이지)가 거기서 실제로 열리는지 확인합니다. 그다음 저장한 레시피를 그대로 돌립니다(`dom` 레시피): 레시피 JSON을 읽어 두고, `pages.start`(param이면 `template`의 1페이지)로 이동 → `scripts/page/helpers.js` 주입 → `window.__scrape.recipePage(recipe, { n, reset: n === 1 })`. 결과의 `next`를 따릅니다: `url`이면 그 주소로 이동, `click`이면 그 자리를 클릭, `scroll`이면 스크롤 후 같은 페이지에서 다시 부르기. `done`이면 끝입니다. 페이지 사이는 사람 속도(3초 이상)로 쉽니다. 행은 네비게이션을 넘어 브라우저에 쌓이고, 마지막에 `window.__scrape.drain({ key: result.key })`로 받아 JSON 파일로 저장한 뒤 `node scripts/write-csv.mjs <그.json> --recipe <name>`을 돌리면 수집기와 **같은** CSV(열 순서·중복 제거·형식)가 됩니다. 레시피가 없는 즉석 수집은 예전처럼 `collectInto(fields, container, { dedupe_key, reset })`를 씁니다.
    - **CDP로 수집기 연결**: 사용자가 자기 Chrome을 `--remote-debugging-port=9222`로(이미 열려 있지 않은 프로필로) 띄우면 `node collect.mjs <name> --cdp 9222`가 그 실제 세션을 몰고, 절대 닫지 않습니다. 새 Playwright 브라우저가 걸리는 일부 보호는 피하지만 강한 안티봇은 CDP도 탐지합니다. 그러면 위의 세션 안 브라우저로.
 5. **솔직히 말하기.** 어느 것도 안 되면 이 사이트는 지금 자동 수집을 허용하지 않는다고, 대안은 무엇이었는지(보통 공식 API) 솔직하게 말하세요.
 
@@ -158,6 +158,7 @@ description: 스크래핑을 모르는 사람이 웹사이트에서 데이터를
 | `diagnose()` | 봇 차단 벤더/종류, 로그인 벽, 유료 벽 신호 |
 | `await robots(path)` | 이 출처의 robots.txt 판정. `crawl_delay`(초)가 있으면 그 값 × 1000을 `rate.delay_ms`의 하한으로 쓴다 |
 | `await autoScroll({rounds, container})` | 무한 스크롤 테스트. 스크롤 후 항목 수. 레딧처럼 지난 글을 지우는 피드는 수가 줄기도 하지만, 수집기가 라운드마다 행을 모으므로 `pages.type: scroll` 그대로 됩니다 |
+| `recipePage(recipe, {n, reset})` | 저장한 `dom` 레시피를 지금 페이지에서 실행해 행을 쌓고 다음 행선지(`next.url`/`click`/`scroll`)와 `done`, `key`를 돌려줌. 사용자의 실제 Chrome에서 레시피를 돌릴 때 |
 | `collectInto(fields, container, {dedupe_key, reset})` | 실제 브라우저 폴백: 이 페이지를 추출해 localStorage에 누적(네비게이션을 넘어 유지) |
 | `fingerprint(fields, container)` / `relocate(fields, container, saved)` | 필드별 생김새 기억 / 바뀐 페이지에서 새 자리 제안(`ok`·`moved`·`lost`). 수집기가 자동으로 부르니 직접 쓸 일은 드뭅니다 |
 | `drain()` / `collectStatus()` | 모은 것 전부 반환+비움 / 지금까지 개수 `{ total }`. 목표 개수에서 멈추려면 `collectStatus().total >= N`을 보세요 |
@@ -176,7 +177,7 @@ node <skill-dir>/scripts/har-scan.mjs <file.har> [--match "화면에 보이는 �
 
 실제 브라우저 폴백 저장기(`drain()` 뒤 — 행을 먼저 `.json` 파일로 저장):
 ```
-node <skill-dir>/scripts/write-csv.mjs <rows.json> --name <name> --dedupe-key <key> [--limit N] [--out PATH] [--format csv|json|jsonl|xlsx]
+node <skill-dir>/scripts/write-csv.mjs <rows.json> (--recipe <name> | --name <name> --dedupe-key <key>) [--limit N] [--out PATH] [--format csv|json|jsonl|xlsx]
 ```
 
 파일: 레시피 `~/.scrape/recipes/`, 세션 `~/.scrape/sessions/`, 이어하기 상태 `~/.scrape/state/`, 필드 기억 `~/.scrape/fingerprints/`, 수집기 Chrome 프로필 `~/.scrape/profile/`, 출력 `~/Downloads/`.

@@ -849,6 +849,7 @@ class Collector {
       if (!out.hint && proposals) out.hint = `The site changed: ${proposals} place(s) in the page moved. Show the proposals in "repair" to the user; if they agree, run: node collect.mjs ${this.recipe.name} --repair --apply`;
     }
     if (this.applied) out.applied = this.applied;
+    if (this.retriedVisible) out.retried_visible = this.retriedVisible; // headless was refused; this run used a visible window
     out.fill_rate = fillRate(this.rows, columns);
     out.sample = this.rows.slice(0, this.dry ? 5 : 3).map(trimRow);
     return out;
@@ -875,7 +876,7 @@ async function main() {
     console.log(JSON.stringify({ ok: false, recipe: opts._[0], error: e.message, stopped_reason: 'error' }));
     return 1;
   }
-  const c = new Collector(recipe, opts);
+  let c = new Collector(recipe, opts);
   // On Ctrl-C / kill, close the browser before exiting so no Chrome window is left behind. The first
   // signal asks the run loop (and the wait-for-human loop) to stop; if cleanup stalls, a second forces exit.
   let shuttingDown = false;
@@ -893,8 +894,23 @@ async function main() {
   process.on('SIGINT', () => { onSignal('interrupted'); });
   process.on('SIGTERM', () => { onSignal('terminated'); });
   let code = 0;
+  let failure = null;
+  try { await c.run(); } catch (e) { failure = e; }
+  // A first page refused to the hidden (headless) browser, like Reddit's "Prove your humanity" page or GeekNews'
+  // 403, usually opens in a visible one, as it would for a person. Try that once before reporting a block. Never on
+  // a --cdp browser (the user's own), never after rows came in, never when --headless was asked for explicitly.
+  if (failure instanceof BlockedError && !opts.cdp && !opts.headful && !opts.headless && !opts['wait-for-human'] && !c.rows.length && ['dom', 'intercept'].includes(recipe.strategy)) {
+    const first = failure.info;
+    c.log(`the hidden browser was refused (${first.vendor || 'unknown'} / ${first.kind}); trying once more with a visible window`);
+    await c.close();
+    opts = { ...opts, headful: true };
+    c = new Collector(recipe, opts);
+    c.retriedVisible = { after: first.kind, vendor: first.vendor || undefined };
+    failure = null;
+    try { await c.run(); } catch (e) { failure = e; }
+  }
   try {
-    await c.run();
+    if (failure) throw failure;
   } catch (e) {
     if (e instanceof BlockedError) {
       c.stop = e.reason;

@@ -11,15 +11,17 @@
  *   node write-csv.mjs <rows.json> [--out PATH] [--format csv|json|jsonl|xlsx] [--name NAME] [--dedupe-key KEY] [--limit N] [--columns a,b,c]
  *   cat rows.json | node write-csv.mjs - [...]
  * --limit N keeps the first N rows after dedupe (a fallback run that scrolled past the requested count).
+ * --recipe NAME takes the name, dedupe key, format and column order from a saved recipe, so rows gathered in the
+ * user's own browser with recipePage() become the same file the collector would have written.
  * Default output: ~/Downloads/<name|scrape>-<YYYYMMDD>.csv
  * Prints one JSON line: { ok, output, rows, columns, fill_rate }.
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { expandHome, FORMATS, localDate, parseArgs, writeRows, unionColumns, fillRate, UsageError } from './lib.mjs';
+import { expandHome, FORMATS, localDate, parseArgs, writeRows, unionColumns, fillRate, loadRecipe, UsageError } from './lib.mjs';
 
-const USAGE = 'usage: node write-csv.mjs <rows.json | -> [--out PATH] [--format csv|json|jsonl|xlsx] [--name NAME] [--dedupe-key KEY] [--limit N] [--columns a,b,c]';
-const SPEC = { out: 'string', format: 'string', name: 'string', 'dedupe-key': 'string', limit: 'number', columns: 'string', help: 'boolean' };
+const USAGE = 'usage: node write-csv.mjs <rows.json | -> [--out PATH] [--format csv|json|jsonl|xlsx] [--name NAME] [--dedupe-key KEY] [--limit N] [--columns a,b,c] [--recipe NAME]';
+const SPEC = { out: 'string', format: 'string', name: 'string', 'dedupe-key': 'string', limit: 'number', columns: 'string', recipe: 'string', help: 'boolean' };
 
 function main() {
   let opts;
@@ -34,6 +36,13 @@ function main() {
   try { rows = JSON.parse(raw); } catch (e) { console.error(`[write-csv] ${src} is not valid JSON: ${e.message}`); return 1; }
   if (!Array.isArray(rows)) { console.error('[write-csv] expected a JSON array of row objects'); return 1; }
 
+  let recipe = null;
+  if (opts.recipe) {
+    try { ({ recipe } = loadRecipe(opts.recipe)); } catch (e) { console.error(`[write-csv] ${e.message}`); return 1; }
+    opts.name = opts.name || recipe.name;
+    opts['dedupe-key'] = opts['dedupe-key'] || recipe.output?.dedupe_key;
+    opts.format = opts.format || recipe.output?.format;
+  }
   if (opts['dedupe-key']) {
     const k = opts['dedupe-key'];
     const seen = new Set();
@@ -47,7 +56,7 @@ function main() {
 
   const format = opts.format || 'csv';
   if (!FORMATS.includes(format)) { console.error(`[write-csv] --format must be one of ${FORMATS.join(', ')}`); return 1; }
-  const columns = opts.columns ? opts.columns.split(',').map((s) => s.trim()).filter(Boolean) : unionColumns(rows);
+  const columns = opts.columns ? opts.columns.split(',').map((s) => s.trim()).filter(Boolean) : unionColumns(recipe?.fields, recipe?.detail?.fields, rows);
   const name = opts.name || 'scrape';
   const date = localDate();
   const ext = format;

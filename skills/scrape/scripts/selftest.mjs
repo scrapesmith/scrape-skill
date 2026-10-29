@@ -130,6 +130,11 @@ function fixtureServer(port = 0) {
     connectedCallback() { const r = this.attachShadow({ mode: 'closed' }); r.innerHTML = '<ul>' + items.map((b) => '<li class="secret">' + b.title + '</li>').join('') + '</ul>'; }
   });
 </script></body></html>`);
+    // Refuses a headless browser (403 to "HeadlessChrome"), serves a visible one: GeekNews and Reddit behave this way.
+    if (u.pathname === '/headless-wall') {
+      if (/HeadlessChrome/.test(req.headers['user-agent'] || '')) return send(res, 403, 'text/html; charset=utf-8', '<!doctype html><title>403 Forbidden</title><h1>Access denied</h1>');
+      return send(res, 200, 'text/html; charset=utf-8', `<!doctype html><html><head><meta charset="utf-8"><title>Fixture wall</title></head><body><ul>${PRODUCTS.map((p) => `<li class="product"><b>${p.title}</b> <span class="price">${p.price}</span></li>`).join('')}</ul></body></html>`);
+    }
     // Virtualized feed (Reddit, X): 50 posts, 10 per load, but only the newest 15 stay in the DOM.
     if (u.pathname === '/recycle') return send(res, 200, 'text/html; charset=utf-8', `<!doctype html><html><head><meta charset="utf-8"><title>Fixture recycle</title></head><body><ul id="list"></ul><script>
   let next = 1, busy = false;
@@ -721,11 +726,11 @@ if (!offline) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'scrape-selftest-'));
   const fixture = await fixtureServer();
   // Async spawn, not spawnSync: the fixture server lives in this process and must keep answering while the collector runs.
-  const run = (recipeFile, args, { keepState = false } = {}) => new Promise((resolve) => {
+  const run = (recipeFile, args, { keepState = false, headlessFlag = true } = {}) => new Promise((resolve) => {
     const name = JSON.parse(fs.readFileSync(recipeFile, 'utf8')).name;
     const out = path.join(tmp, `${name}.csv`);
     if (!keepState) fs.rmSync(path.join(os.homedir(), '.scrape', 'state', `${name}.json`), { force: true });
-    const child = spawn('node', [path.join(DIR, 'collect.mjs'), recipeFile, '--headless', '--quiet', '--out', out, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('node', [path.join(DIR, 'collect.mjs'), recipeFile, ...(headlessFlag ? ['--headless'] : []), '--quiet', '--out', out, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '';
     child.stdout.on('data', (d) => { stdout += d; });
     child.stderr.on('data', (d) => { stderr += d; });
@@ -861,6 +866,40 @@ if (!offline) {
     const n2 = await run(recipeAt(2, 'nomem'), ['--dry-run']);
     ok('repair: with no memory, empty fields are named instead of passing silently', eq(n2.summary.repair?.unlearned, ['title', 'price', 'link']) && /no memory/.test(n2.summary.repair?.note || ''), n2.summary.repair);
     fs.rmSync(fpFile, { force: true });
+  }
+  // a hidden browser refused on the first page: one retry with a visible window (this test briefly opens a window);
+  // with --headless asked for explicitly the block is reported as before
+  const WALL = { version: 1, name: 'local-headless-wall', strategy: 'dom', pages: { type: 'single', start: `${FIXTURE_ORIGIN}/headless-wall` }, items: { container: 'li.product' }, fields: { title: 'b', price: { selector: '.price', transform: 'price' } } };
+  const wallAuto = await run(local(WALL), [], { headlessFlag: false });
+  ok('live: hidden browser refused → one visible retry gets the rows', wallAuto.code === 0 && wallAuto.summary.rows === 15 && wallAuto.summary.retried_visible?.after === 'access_denied', { code: wallAuto.code, rows: wallAuto.summary.rows, retried: wallAuto.summary.retried_visible });
+  const wallStrict = await run(local({ ...WALL, name: 'local-headless-wall-strict' }), []);
+  ok('live: --headless asked for → no retry, blocked, exit 3', wallStrict.code === 3 && wallStrict.summary.stopped_reason === 'blocked' && !wallStrict.summary.retried_visible, { code: wallStrict.code, stopped: wallStrict.summary.stopped_reason });
+  // recipePage: a saved recipe driven page by page in "the user's browser" (here a plain Playwright page), then
+  // write-csv --recipe gives the same rows and columns the collector writes
+  {
+    const { chromium } = await import('playwright-core');
+    const LAZYR = { version: 1, name: 'local-recipepage', source: `${FIXTURE_ORIGIN}/`, strategy: 'dom', pages: { type: 'param', template: `${FIXTURE_ORIGIN}/lazy?page={n}`, max_pages: 5 }, items: { container: 'li.item' }, fields: { item: ':scope' }, output: { dedupe_key: 'item' } };
+    const recipeFile = local(LAZYR);
+    const R = JSON.parse(fs.readFileSync(recipeFile, 'utf8'));
+    const browser = await chromium.launch({ channel: 'chrome', headless: true }).catch(() => chromium.launch({ headless: true }));
+    const pg = await browser.newPage();
+    const steps = [];
+    let next = { url: R.pages.template.replace('{n}', '1'), n: 1 };
+    while (next && steps.length < 6) {
+      await pg.goto(next.url);
+      await pg.addScriptTag({ path: HELPERS_PATH });
+      const r = await pg.evaluate(([rec, n]) => window.__scrape.recipePage(rec, { n, reset: n === 1 }), [R, next.n]);
+      steps.push({ n: r.page, rows: r.page_rows, added: r.added, done: r.done });
+      next = r.next;
+    }
+    const rows = await pg.evaluate(() => window.__scrape.drain({ key: '__scrape_recipe_local-recipepage' }));
+    await browser.close();
+    ok('recipePage: pages 1-2 then a page with nothing new ends the run', eq(steps.map((x) => x.added), [10, 10, 0]) && steps[2].done && rows.length === 20, steps);
+    const rowsFile = path.join(tmp, 'recipepage.json');
+    fs.writeFileSync(rowsFile, JSON.stringify(rows));
+    const wcr = spawnSync('node', [path.join(DIR, 'write-csv.mjs'), rowsFile, '--recipe', recipeFile, '--out', path.join(tmp, 'recipepage.csv')], { encoding: 'utf8' });
+    let wr = {}; try { wr = JSON.parse((wcr.stdout || '').trim().split('\n').pop()); } catch { /* */ }
+    ok('write-csv --recipe: columns in recipe order, deduped by the recipe key', wr.ok && wr.rows === 20 && eq(wr.columns, ['item']), wr);
   }
   // xlsx + --resume: the second run starts from the rows kept in ~/.scrape/state, so the workbook ends with all 20
   const xfile = path.join(tmp, 'cursor.xlsx');

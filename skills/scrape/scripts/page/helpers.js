@@ -1403,6 +1403,46 @@
     const firstField = Object.keys(fields || {})[0];
     return { page_items: rows.length, added, total: store.length, sample: rows.slice(0, 2).map((r) => r[firstField]) };
   };
+  // ---------- a saved recipe, run in any browser ----------
+  // The real-browser fallback driven by a recipe: extract this page with the recipe's own fields, container,
+  // required columns and dedupe key, add the rows to the pile kept across navigations (localStorage), and say where
+  // to go next. Whoever drives the browser (Claude in Chrome on the user's own Chrome, the visible MCP window) just
+  // loops: open next.url → inject helpers → recipePage(recipe, { n: next.n }) until done. drain({ key }) at the end.
+  S.recipePage = (recipe, opts = {}) => {
+    const r = recipe || {};
+    if (r.strategy && r.strategy !== 'dom') return { error: 'recipePage runs dom recipes; http/embedded/intercept recipes need the collector (or --cdp)' };
+    const p = r.pages || {};
+    const container = r.items && r.items.container;
+    const key = opts.key || '__scrape_recipe_' + (r.name || 'run');
+    const dedupe = r.output && r.output.dedupe_key;
+    const require = (r.items && r.items.require) || [];
+    let store;
+    try { store = opts.reset ? [] : JSON.parse(localStorage.getItem(key) || '[]'); } catch (e) { store = []; }
+    const seen = new Set(dedupe ? store.map((x) => x[dedupe]).filter((v) => v != null) : []);
+    const rows = S.extract(r.fields, container).filter((x) => require.every((k) => x[k] != null && x[k] !== ''));
+    let added = 0;
+    for (const row of rows) {
+      const k = dedupe ? row[dedupe] : null;
+      if (k != null && seen.has(k)) continue;
+      if (k != null) seen.add(k);
+      store.push(row);
+      added++;
+    }
+    try { localStorage.setItem(key, JSON.stringify(store)); } catch (e) { return { error: 'localStorage unavailable (private window / full)', page_rows: rows.length, added: 0 }; }
+    const n = opts.n || 1;
+    const max = opts.max_pages || p.max_pages || p.max_rounds || 20;
+    let next = null;
+    if (p.type === 'scroll') next = n < max && (added > 0 || n === 1) ? { scroll: true, n: n + 1 } : null; // scroll, then call again
+    else if (n >= max || (n > 1 && !added)) next = null; // page limit reached, or a page with nothing new is the end
+    else if (p.type === 'param' && p.template) next = { url: p.template.replace('{n}', String((p.start_n ?? 1) + n * (p.step ?? 1))), n: n + 1 };
+    else if (p.type === 'urls' && Array.isArray(p.urls)) next = p.urls[n] ? { url: p.urls[n], n: n + 1 } : null;
+    else if (p.type === 'next_link' && p.next_selector) {
+      const a = qsa(p.next_selector)[0];
+      const href = a && a.getAttribute('href');
+      next = a ? (href && !/^(#|javascript:)/i.test(href.trim()) ? { url: new URL(href, location.href).href, n: n + 1 } : { click: p.next_selector, n: n + 1 }) : null;
+    }
+    return { key, page: n, page_rows: rows.length, added, total: store.length, next, done: !next };
+  };
   // Return everything collected so far and clear it (keep: true to leave it in place).
   S.drain = (opts = {}) => {
     const key = opts.key || S.collectKey;
@@ -1459,6 +1499,7 @@
     collectInto: 'collectInto(fields, container, {dedupe_key, reset}) -> extract this page and accumulate in localStorage (real-browser fallback for blocked sites)',
     drain: 'drain() -> return everything collectInto() gathered and clear it; pass to write-csv.mjs',
     collectStatus: 'collectStatus() -> { total }: how many rows accumulated so far',
+    recipePage: 'recipePage(recipe, { n, reset }) -> run a saved dom recipe on this page, keep the rows across navigations, return { next: { url | click | scroll, n }, done, key }',
   });
 
   window.__scrape = S;
