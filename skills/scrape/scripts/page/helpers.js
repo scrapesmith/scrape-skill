@@ -69,7 +69,7 @@
     // An element inside a shadow root is addressed from its own root; queries fall back into shadow roots, so
     // "div.title" relative to an item still finds the title inside the item's web component.
     if (!(root === document ? document.contains(el) : root.contains(el))) root = el.getRootNode();
-    const isTop = root === document || root.nodeType === 11;
+    const isTop = root === document || root.nodeType === 11 || root.nodeType === 9;
     const parts = [];
     const scope = root === document ? document : root;
     // Does [p, ...parts] pin exactly one element inside root? Tested as a descendant chain, which is the
@@ -128,10 +128,20 @@
   // selectors cannot cross. A query runs in the light DOM first, exactly as before; only when that finds nothing
   // on a page that has shadow roots does it also look inside every open shadow root below the scope. "a >>> b"
   // says it explicitly: b inside the shadow root of each a. Closed shadow roots stay invisible to page scripts.
+  // A same-origin iframe's document is readable the same way; a cross-origin one throws or is null and is left to the
+  // collector, which can reach every frame through the browser itself (recipe "frame").
+  const frameDoc = (el) => {
+    if (el.tagName !== 'IFRAME' && el.tagName !== 'FRAME') return null;
+    try { const d = el.contentDocument; return d && d.documentElement ? d : null; } catch (e) { return null; }
+  };
   const shadowRootsUnder = (scope) => {
     const out = [];
     const visit = (root) => {
-      for (const e of root.querySelectorAll('*')) if (e.shadowRoot) { out.push(e.shadowRoot); visit(e.shadowRoot); }
+      for (const e of root.querySelectorAll('*')) {
+        if (e.shadowRoot) { out.push(e.shadowRoot); visit(e.shadowRoot); }
+        const d = frameDoc(e);
+        if (d) { out.push(d); visit(d); }
+      }
     };
     if (scope.shadowRoot) { out.push(scope.shadowRoot); visit(scope.shadowRoot); }
     visit(scope);
@@ -140,7 +150,7 @@
   let shadowSeen = { at: 0, any: false };
   const pageHasShadow = () => {
     const now = Date.now();
-    if (now - shadowSeen.at > 1000) shadowSeen = { at: now, any: [...document.querySelectorAll('*')].some((e) => e.shadowRoot) };
+    if (now - shadowSeen.at > 1000) shadowSeen = { at: now, any: [...document.querySelectorAll('*')].some((e) => e.shadowRoot || frameDoc(e)) };
     return shadowSeen.any;
   };
   // Every element under scope, shadow roots included (list detection, text search, candidate fields).
@@ -157,7 +167,7 @@
     if (sel.includes('>>>')) {
       let cur = [scope];
       sel.split('>>>').map((x) => x.trim()).forEach((part, i) => {
-        cur = cur.flatMap((n) => { const base = i === 0 ? n : n.shadowRoot; return base && part ? lightQsa(part, base) : []; });
+        cur = cur.flatMap((n) => { const base = i === 0 ? n : n.shadowRoot || frameDoc(n); return base && part ? lightQsa(part, base) : []; });
       });
       return cur;
     }
@@ -347,7 +357,7 @@
     const urlish = spec.attr && /^(href|src|data-src|data-href|action|poster)$/.test(spec.attr);
     if (spec.absolute || (urlish && spec.absolute !== false)) {
       try {
-        v = new URL(v, location.href).href;
+        v = new URL(v, e.baseURI || location.href).href;
       } catch (e2) {
         /* leave as is */
       }
@@ -389,6 +399,7 @@
   S.count = (sel) => qsa(sel).length; // what the collector counts while scrolling, shadow roots included
   // fields: { name: 'css' | { selector, attr, all, join, regex, map, transform: 'number'|'trim'|'count'|'date'|'price'|'currency'|'clean_url', tz, absolute } | { template } }
   // container: css for each item (one row per match). Omit for a single-row page.
+  let ocrSeq = 0;
   S.extract = (fields, container) => {
     const scopes = container ? qsa(container) : [document];
     const rows = [];
@@ -399,6 +410,13 @@
         const spec = typeof raw === 'string' ? { selector: raw } : raw || {};
         if (spec.template != null) { row[name] = null; continue; } // filled below from the other columns
         const els = resolve(spec.selector, sc);
+        // attr: "ocr" — the value exists only as pixels (canvas, an image of text). Mark the element; the collector
+        // photographs it and reads the text with OCR, then applies regex/map/transform like any other field.
+        if (spec.attr === 'ocr') {
+          // two fields on one element (a price and its currency) share the mark rather than overwrite it
+          if (els.length) { const id = els[0].getAttribute('data-scrape-ocr') || 'o' + ++ocrSeq; els[0].setAttribute('data-scrape-ocr', id); row[name] = { __ocr: id }; any = true; } else row[name] = null;
+          continue;
+        }
         // transform: "count" — the value is how many elements match (star icons, badges, thumbnails), not their text
         if (spec.transform === 'count') {
           row[name] = els.length;
@@ -1468,7 +1486,7 @@
       images: qsa('img').length,
       tables: qsa('table').length,
       forms: qsa('form').length,
-      iframes: qsa('iframe').slice(0, 5).map((f) => cut(f.getAttribute('src') || '', 100)),
+      iframes: lightQsa('iframe').slice(0, 5).map((f) => ({ src: cut(f.src || f.getAttribute('src') || '', 100), readable: !!frameDoc(f) })), // readable = same origin: helpers see inside; otherwise use recipe "frame"
       shadow_roots: shadow,
       diagnosis: S.diagnose(),
       lists: S.detectLists({ min: opts.min_items || 3, limit: 3 }).map((l) => ({ container: l.container, count: l.count, sample: l.sample, fields: l.fields.slice(0, 6).map((f) => ({ selector: f.selector, samples: f.samples.slice(0, 2) })) })),

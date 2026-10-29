@@ -109,12 +109,23 @@ export function validateRecipe(r) {
     if (!tmpl || !tmpl.includes('{n}')) fail(r.strategy === 'http' ? '"http.url_template" (or "pages.template") must contain {n}' : '"pages.template" must contain {n}');
   }
   if (!r.fields || typeof r.fields !== 'object') fail('"fields" is required');
+  if (r.frame != null) {
+    if (typeof r.frame !== 'string' || !r.frame) fail('"frame" must be a non-empty string: a regex matched against the iframe\'s URL or name');
+    if (r.strategy !== 'dom') fail('"frame" only works with strategy dom');
+    try { new RegExp(r.frame); } catch { fail('"frame" is not a valid regular expression'); }
+  }
   // A misspelled transform ("prise") would otherwise be ignored silently and leave the raw text in the column.
   const fieldSets = [[r.fields, r.strategy], [r.detail?.fields || {}, r.detail?.strategy || 'dom']];
   for (const [set, strategy] of fieldSets) for (const [name, f] of Object.entries(set)) {
     const fp = f && typeof f === 'object' ? f.path ?? f.selector : null;
     if (Array.isArray(fp) && (!fp.length || !fp.every((x) => typeof x === 'string'))) fail(`field "${name}": a "path" list must hold one or more path strings`);
     if (Array.isArray(fp) && strategy === 'dom') fail(`field "${name}": a list of paths only works with http, embedded or intercept (dom selectors can use "a, b")`);
+  }
+  for (const [set, strategy] of fieldSets) for (const [name, f] of Object.entries(set)) {
+    if (!f || typeof f !== 'object' || f.attr !== 'ocr') continue;
+    if (strategy !== 'dom') fail(`field "${name}": attr "ocr" only works on dom fields`);
+    const o = f.ocr || {};
+    if (typeof o !== 'object' || (o.lang != null && !/^[a-z_]+(\+[a-z_]+)*$/.test(o.lang)) || (o.chars != null && typeof o.chars !== 'string') || (o.psm != null && !Number.isInteger(o.psm))) fail(`field "${name}": "ocr" takes { lang: "eng" | "kor+eng" …, chars: "0123456789", psm: 6 }`);
   }
   for (const [name, f] of [...Object.entries(r.fields), ...Object.entries(r.detail?.fields || {})]) {
     if (f && typeof f === 'object' && f.transform != null && !TRANSFORMS.includes(f.transform)) fail(`field "${name}": "transform" must be one of ${TRANSFORMS.join(', ')}`);

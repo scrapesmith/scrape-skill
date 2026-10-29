@@ -12,12 +12,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import {
   SCRIPTS_DIR, HELPERS_PATH, SCRAPE_HOME, FORMATS,
   UsageError, EnvError, BlockedError,
   expandHome, sleep, isEmpty, hasAnyValue, shorten, localDate, jittered, parseArgs, loadRecipe,
   defaultHeaders, mergeHeaders, loadStorageState, cookieHeader, detectBlockedHttp,
-  jsonRows, finishRows, extractEmbedded, writeRows, fillRate, unionColumns, tryParse, cursorUrl, fillBody, nextCursor, nextUrl, decodeBinaryFrame, messageMatches,
+  jsonRows, jsonField, finishRows, extractEmbedded, writeRows, fillRate, unionColumns, tryParse, cursorUrl, fillBody, nextCursor, nextUrl, decodeBinaryFrame, messageMatches,
 } from './lib.mjs';
 
 const USAGE = `usage: node collect.mjs <recipe.json | recipe-name> [--max-pages N] [--limit N] [--dry-run] [--out PATH]
@@ -30,6 +31,7 @@ A bare name resolves to ~/.scrape/recipes/<name>.json.
       it is never closed on exit. For sites even that cannot pass, see the real-browser fallback in SKILL.md.`;
 const ARGS = { 'max-pages': 'number', limit: 'number', 'dry-run': 'boolean', out: 'string', format: 'string', headless: 'boolean', headful: 'boolean', resume: 'boolean', 'wait-for-human': 'boolean', cdp: 'string', quiet: 'boolean', repair: 'boolean', apply: 'boolean', help: 'boolean' };
 const NAV_TIMEOUT = 45_000;
+const OCR_VERSION = '7.0.0'; // tesseract.js, installed on first use of attr "ocr"
 const HUMAN_WAIT_MS = 5 * 60_000;
 const INTERCEPT_TIMEOUT = 10_000; // default intercept.timeout_ms
 const INTERCEPT_SETTLE_MS = 100;  // default intercept.settle_ms: quiet time after the last matching call before moving on
@@ -631,7 +633,9 @@ class Collector {
     const tried = [];
     for (const channel of ['chrome', 'msedge', undefined]) {
       try {
-        this.context = await pw.chromium.launchPersistentContext(profile, { channel, headless, viewport: { width: 1280, height: 900 } });
+        // OCR reads small text better from a sharper picture: render at 2x when a field is read by OCR.
+        const scale = this.usesOcr() ? { deviceScaleFactor: 2 } : {};
+        this.context = await pw.chromium.launchPersistentContext(profile, { channel, headless, viewport: { width: 1280, height: 900 }, ...scale });
         this.log(`browser: ${channel || 'bundled chromium'} (${headless ? 'headless' : 'headful'})`);
         break;
       } catch (e) { tried.push(`${channel || 'bundled chromium'}: ${String(e.message).split('\n')[0]}`); }
@@ -760,9 +764,9 @@ class Collector {
     const file = this.fingerprintFile();
     let saved = null;
     try { saved = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* nothing learned yet */ }
-    await this.inject(page);
+    const target = await this.frameTarget(page);
     let fresh = null;
-    try { fresh = await page.evaluate(([f, c]) => window.__scrape.fingerprint(f, c), [fields, container]); } catch { return; }
+    try { fresh = await target.evaluate(([f, c]) => window.__scrape.fingerprint(f, c), [fields, container]); } catch { return; }
     // Learn only from a page with a real list, and only the fields that are healthy now: a broken field keeps
     // the memory of how it looked before it broke, which is exactly what relocation needs.
     if (fresh && fresh.container.count >= 3 && Object.keys(fresh.fields).length) {
@@ -770,7 +774,7 @@ class Collector {
       try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(saved, null, 2)); } catch { /* read-only home: repair just has less to go on */ }
     }
     let res;
-    try { res = await page.evaluate(([f, c, sv]) => window.__scrape.relocate(f, c, sv), [fields, container, saved]); } catch { return; }
+    try { res = await target.evaluate(([f, c, sv]) => window.__scrape.relocate(f, c, sv), [fields, container, saved]); } catch { return; }
     const moved = Object.entries(res.fields).filter(([, x]) => x.status === 'moved');
     // "lost" is only news for a field that used to work; a field that was always sparse is not a regression.
     const lost = Object.entries(res.fields).filter(([k, x]) => x.status === 'lost' && saved?.fields?.[k]).map(([k]) => k);
@@ -788,9 +792,119 @@ class Collector {
     if (parts.length) this.log(`self-repair: ${parts.join(' | ')}`);
   }
 
+  // ---------- iframes ----------
+  // Same-origin iframes are read by the helpers themselves. A cross-origin one is walled off from page scripts but
+  // not from the browser: recipe "frame" (a regex on the frame's URL or name) names it, and extraction, fingerprints
+  // and relocation then run inside that frame. Returns the page itself when no frame is asked for.
+  async frameTarget(page) {
+    if (!this.recipe.frame) { await this.inject(page); return page; }
+    const re = new RegExp(this.recipe.frame);
+    const timeout = this.recipe.wait?.timeout_ms ?? 15_000;
+    const deadline = Date.now() + timeout;
+    let frame = null;
+    while (!frame && Date.now() < deadline) {
+      frame = page.frames().find((f) => f !== page.mainFrame() && (re.test(f.url()) || re.test(f.name())));
+      if (!frame) await sleep(250);
+    }
+    if (!frame) { this.log(`no iframe matches "frame": ${this.recipe.frame}; reading the page itself`); await this.inject(page); return page; }
+    const container = this.recipe.items?.container;
+    if (container) await frame.waitForSelector(container, { timeout: Math.max(1000, deadline - Date.now()), state: 'attached' }).catch(() => {});
+    try { await frame.evaluate(HELPERS_SRC); } catch { /* frame navigating; the next call retries */ }
+    return frame;
+  }
+
+  // ---------- OCR ----------
+  // Fields with attr "ocr" come back from the page as { __ocr: id } markers on elements. Each marked element is
+  // photographed (2x) and read by Tesseract.js, installed on first use (pinned, ~30 MB) with language data cached in
+  // ~/.scrape/ocr; the text then goes through regex/map/transform exactly like a JSON field.
+  usesOcr() { return [this.recipe.fields, this.recipe.detail?.fields].some((fs) => Object.values(fs || {}).some((f) => f && typeof f === 'object' && f.attr === 'ocr')); }
+
+  async ocrEngine() {
+    if (this._ocr) return this._ocr;
+    const req = createRequire(path.join(SCRIPTS_DIR, 'package.json'));
+    let T;
+    try { T = req('tesseract.js'); } catch {
+      this.log(`installing the OCR engine (tesseract.js ${OCR_VERSION}, about 30 MB; first OCR field only)…`);
+      const r = spawnSync('npm', ['install', '--no-save', '--no-audit', '--no-fund', `tesseract.js@${OCR_VERSION}`], { cwd: SCRIPTS_DIR, stdio: ['ignore', 2, 2], shell: process.platform === 'win32' });
+      // Node remembers, for the life of the process, that the package folder was missing a moment ago, so resolving
+      // "tesseract.js" by name still fails right after the install. Load its entry file by its exact path instead.
+      try {
+        if (r.status !== 0) throw new Error(`npm exited with ${r.status}`);
+        const dir = path.join(SCRIPTS_DIR, 'node_modules', 'tesseract.js');
+        const main = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).main || 'index.js';
+        T = req(path.join(dir, main));
+      } catch (e) { throw new EnvError(`OCR needs tesseract.js and it could not be installed or loaded (${e.message}). Run: cd "${SCRIPTS_DIR}" && npm install --no-save tesseract.js@${OCR_VERSION}`); }
+    }
+    const Tess = T.default || T;
+    const cachePath = path.join(SCRAPE_HOME, 'ocr');
+    fs.mkdirSync(cachePath, { recursive: true });
+    this._ocrWorkers = new Map();
+    this._ocr = async (png, o = {}) => {
+      const lang = o.lang || 'eng';
+      let w = this._ocrWorkers.get(lang);
+      if (!w) { w = await Tess.createWorker(lang, 1, { cachePath, logger: () => {} }); this._ocrWorkers.set(lang, w); }
+      await w.setParameters({ tessedit_char_whitelist: o.chars || '', tessedit_pageseg_mode: String(o.psm || 6) });
+      const { data } = await w.recognize(png);
+      return data.text.replace(/\s+/g, ' ').trim();
+    };
+    return this._ocr;
+  }
+
+  // A picture of one element. It must be on screen: scrolling the element only moves its own document, so an element
+  // in an iframe further down needs the iframe brought into view in the page first. Inside a cross-origin iframe an
+  // element screenshot can stall; then the page is photographed, clipped to the element's box.
+  async shoot(page, frame, el) {
+    if (frame && frame !== page.mainFrame()) await (await frame.frameElement().catch(() => null))?.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+    await el.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+    try { return await el.screenshot({ scale: 'device', timeout: 5000, animations: 'disabled' }); } catch (e) {
+      const box = await el.boundingBox();
+      if (!box) throw e;
+      return page.screenshot({ clip: box, scale: 'device', animations: 'disabled' });
+    }
+  }
+
+  async readOcr(target, fields, rows) {
+    const specs = Object.entries(fields || {}).filter(([, f]) => f && typeof f === 'object' && f.attr === 'ocr');
+    if (!specs.length || !rows.some((r) => specs.some(([n]) => r[n] && r[n].__ocr))) return rows;
+    const ocr = await this.ocrEngine();
+    const read = new Map(); // one picture and one OCR pass per element and setting, however many fields use it
+    for (const row of rows) {
+      for (const [name, spec] of specs) {
+        const mark = row[name];
+        if (!mark || !mark.__ocr) continue;
+        let text = '';
+        const memo = `${mark.__ocr}|${JSON.stringify(spec.ocr || {})}`;
+        if (read.has(memo)) text = read.get(memo);
+        else try {
+          // The marked element may sit in a same-origin iframe the helpers looked into; search every frame.
+          const sel = `[data-scrape-ocr="${mark.__ocr}"]`;
+          const page = typeof target.frames === 'function' ? target : target.page();
+          let el = null;
+          let inFrame = null;
+          for (const f of page.frames()) { el = await f.$(sel).catch(() => null); if (el) { inFrame = f; break; } }
+          if (el) text = await ocr(await this.shoot(page, inFrame, el), spec.ocr);
+        } catch (e) { this.log(`OCR of ${name} failed: ${shorten(e.message, 80)}`); }
+        read.set(memo, text);
+        const { attr, selector, ocr: _o, ...rest } = spec;
+        row[name] = text ? jsonField({ v: text }, { ...rest, path: 'v' }) : null;
+      }
+    }
+    return rows;
+  }
+
   async extractDom(page, fields, container) {
-    await this.inject(page);
-    const rows = await page.evaluate(([f, c]) => window.__scrape.extract(f, c), [fields, container || null]);
+    const target = await this.frameTarget(page);
+    let rows = await target.evaluate(([f, c]) => window.__scrape.extract(f, c), [fields, container || null]);
+    rows = await this.readOcr(target, fields, rows);
+    // Nothing on the page, but the list may sit in a cross-origin iframe the page cannot read: find it and say how
+    // to point the recipe at it, instead of a silent empty run.
+    if (container && !rows.length && !this.recipe.frame && !this.frameHint) {
+      for (const f of page.frames()) {
+        if (f === page.mainFrame()) continue;
+        const n = await f.evaluate((c) => document.querySelectorAll(c).length, container).catch(() => 0);
+        if (n) { this.frameHint = { url: f.url(), name: f.name() || undefined, items: n }; this.log(`the ${n} items are inside an iframe (${f.url()}); add "frame" to the recipe`); break; }
+      }
+    }
     return container ? rows : rows.filter(hasAnyValue); // no container = one row per page; an all-empty page counts as empty
   }
 
@@ -807,6 +921,8 @@ class Collector {
     this.browser = null;
     // --cdp: the browser is the user's own. Never close it or their tabs, and don't risk browser.close()
     // tearing it down — just drop the reference; the CDP socket closes when this process exits.
+    for (const w of this._ocrWorkers?.values() || []) await w.terminate().catch(() => {});
+    this._ocrWorkers = null;
     if (cdp) { void browser; return; }
     if (!ctx) return;
     // close() can hang when a page is mid-navigation; bound it, then make sure the process is really gone.
@@ -849,7 +965,11 @@ class Collector {
       if (!out.hint && proposals) out.hint = `The site changed: ${proposals} place(s) in the page moved. Show the proposals in "repair" to the user; if they agree, run: node collect.mjs ${this.recipe.name} --repair --apply`;
     }
     if (this.applied) out.applied = this.applied;
-    if (this.retriedVisible) out.retried_visible = this.retriedVisible; // headless was refused; this run used a visible window
+    if (this.retriedVisible) out.retried_visible = this.retriedVisible;
+    if (this.frameHint) {
+      out.frame_hint = this.frameHint;
+      if (!out.hint) out.hint = `The list is inside an iframe the page cannot read (${this.frameHint.url}). Add "frame": "<part of that URL>" to the recipe and run again.`;
+    } // headless was refused; this run used a visible window
     out.fill_rate = fillRate(this.rows, columns);
     out.sample = this.rows.slice(0, this.dry ? 5 : 3).map(trimRow);
     return out;
