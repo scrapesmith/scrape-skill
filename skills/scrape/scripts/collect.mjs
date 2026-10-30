@@ -355,9 +355,14 @@ class Collector {
     const cap = this.recipe.strategy === 'intercept' ? await this.capture(page) : null;
     try {
       if (target.click) {
-        // "next" is a button, not a link: click it and give the page time to swap content or navigate.
+        // "next" is a button (or a #hash link): click it and give the page time to swap content or navigate.
+        // networkidle can settle before a script swaps the list in place, so also wait for the items to change.
+        const sig = (sel) => page.evaluate((s) => { try { return [...document.querySelectorAll(s)].map((e) => e.textContent.trim()).join('\u0001'); } catch (e) { return ''; } }, sel).catch(() => null);
+        const container = this.recipe.items?.container;
+        const before = container ? await sig(container) : null;
         await page.locator(this.pages.next_selector).first().click({ timeout: 10_000 });
         await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
+        if (before) for (let t = 0; t < 40 && (await sig(container)) === before; t++) await page.waitForTimeout(250);
         await this.inject(page);
         await this.guard(page);
         await this.applyWait(page, this.recipe.wait);
@@ -369,6 +374,7 @@ class Collector {
         next = await page.evaluate((sel) => {
           const a = document.querySelector(sel);
           if (!a) return null;
+          if (a.disabled || a.getAttribute('aria-disabled') === 'true' || a.closest('[disabled], .disabled')) return null; // greyed-out "next" on the last page
           const href = a.getAttribute('href');
           if (href && !/^(#|javascript:)/i.test(href.trim())) return { url: new URL(href, location.href).href };
           return { click: true };

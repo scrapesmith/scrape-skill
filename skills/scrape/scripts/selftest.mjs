@@ -148,6 +148,14 @@ function fixtureServer(port = 0) {
     if (u.pathname === '/ocr') return send(res, 200, 'text/html; charset=utf-8', `<!doctype html><html><head><meta charset="utf-8"><title>Fixture OCR</title><style>body{font-family:Arial,sans-serif;background:#fff} li{list-style:none;margin:12px 0;display:flex;gap:16px;align-items:center}</style></head><body><ul>${[[1, 'Alpha lamp', '12.50'], [2, 'Beta chair', '48.00'], [3, 'Gamma desk', '135.25'], [4, 'Delta shelf', '9.99']].map(([r, t, p]) => `<li class="item"><img class="rank" width="60" height="40" alt="" src="data:image/svg+xml,${encodeURIComponent(`<svg xmlns='http://www.w3.org/2000/svg' width='60' height='40'><rect width='60' height='40' fill='white'/><text x='6' y='30' font-family='Arial' font-size='28' fill='black'>${r}</text></svg>`)}"><b>${t}</b><canvas class="price" width="180" height="44" data-p="${p}"></canvas></li>`).join('')}</ul><script>
   for (const c of document.querySelectorAll('canvas.price')) { const x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); x.fillStyle = '#000'; x.font = '30px Arial'; x.fillText('$' + c.dataset.p, 8, 33); c.removeAttribute('data-p'); }
 </script></body></html>`);
+    // "Next" is a button that swaps the list in place some time after the click (no navigation, no request in flight
+    // at first), and is disabled on the last page: 4 pages x 5 items.
+    if (u.pathname === '/swap') return send(res, 200, 'text/html; charset=utf-8', `<!doctype html><html><head><meta charset="utf-8"><title>Fixture swap</title></head><body><ul id="list"></ul><button id="next" type="button">Next</button><script>
+  let page = 1; const list = document.getElementById('list'), next = document.getElementById('next');
+  const show = () => { list.innerHTML = Array.from({ length: 5 }, (_, i) => '<li class="item">Swap item ' + ((page - 1) * 5 + i + 1) + '</li>').join(''); next.disabled = page === 4; };
+  next.addEventListener('click', () => { page++; setTimeout(show, 400); });
+  show();
+</script></body></html>`);
     // Virtualized feed (Reddit, X): 50 posts, 10 per load, but only the newest 15 stay in the DOM.
     if (u.pathname === '/recycle') return send(res, 200, 'text/html; charset=utf-8', `<!doctype html><html><head><meta charset="utf-8"><title>Fixture recycle</title></head><body><ul id="list"></ul><script>
   let next = 1, busy = false;
@@ -780,7 +788,10 @@ if (!offline) {
   const FEED = { version: 1, name: 'local-intercept-cursor', strategy: 'intercept', pages: { type: 'cursor', start: `${FIXTURE_ORIGIN}/feed`, cursor_path: 'next_cursor', load_more_selector: '#more', idle_ms: 500 }, intercept: { url_match: '/api/feed', timeout_ms: 5000 }, items: { path: 'items[]' }, fields: { id: 'id', title: 'title' } };
   const RECYCLE = { version: 1, name: 'local-recycle-scroll', source: `${FIXTURE_ORIGIN}/`, strategy: 'dom', pages: { type: 'scroll', start: `${FIXTURE_ORIGIN}/recycle`, max_rounds: 20, idle_ms: 500 }, wait: { selector: 'li.post' }, items: { container: 'li.post' }, fields: { id: { attr: 'data-id' }, title: 'a', link: { selector: 'a', attr: 'href' } }, output: { dedupe_key: 'link' }, rate: { delay_ms: 100, jitter_ms: 50 } };
   const LAZY = { version: 1, name: 'local-lazy-scroll', strategy: 'dom', pages: { type: 'param', template: `${FIXTURE_ORIGIN}/lazy?page={n}`, max_pages: 5 }, wait: { selector: 'li.item', scroll: { count: 20, idle_ms: 400 } }, items: { container: 'li.item' }, fields: { item: ':scope' }, rate: { delay_ms: 100, jitter_ms: 50 } };
+  const SWAP = { version: 1, name: 'local-swap-click', strategy: 'dom', pages: { type: 'next_link', start: `${FIXTURE_ORIGIN}/swap`, next_selector: '#next' }, items: { container: 'li.item' }, fields: { item: ':scope' }, rate: { delay_ms: 100, jitter_ms: 50 } };
   live.push(
+    // a "next" button that swaps the list in place after a delay: every page read once, the disabled button ends the run
+    ['local-swap-click', local(SWAP), [], 20, (s) => s.rows === 20 && s.pages_done === 4 && s.stopped_reason === 'no_next_link'],
     // http + cursor: 4 pages x 5 rows, first request without the cursor param, null cursor ends the run
     ['local-cursor', local('local-cursor'), [], 20, (s) => s.rows === 20 && s.pages_done === 4 && s.stopped_reason === 'cursor_end'],
     // the same feed as a GraphQL POST: {cursor} inside http.body (null on the first page); concurrency is ignored
